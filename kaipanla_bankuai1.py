@@ -154,12 +154,20 @@ def get_stock_data_tencent(stock_codes):
                     continue
 
                 content = line.split('~')
-                # 腾讯数据位比较多，确保长度足够
+                # 腾讯数据位：3现价 4昨收 5今开 31涨跌额 32涨幅% 33最高 34最低 36成交量 37成交额
                 if len(content) > 37:
+                    price = float(content[3])
+                    try:
+                        open_p = float(content[5]) if content[5] else 0
+                        open_chg_pct = round((price - open_p) / open_p * 100, 2) if open_p and open_p > 0 else None
+                    except (ValueError, IndexError):
+                        open_chg_pct = None
                     all_results.append({
-                        "代码": content[2],  # v_code (纯数字代码)
-                        "名称": content[1],  # v_name
-                        "价格": float(content[3]),
+                        "代码": content[2],
+                        "名称": content[1],
+                        "价格": price,
+                        "今开": float(content[5]) if len(content) > 5 and content[5] else None,
+                        "开盘涨幅%": open_chg_pct,
                         "涨跌额": float(content[31]),
                         "涨幅%": float(content[32]),
                         "最高": float(content[33]),
@@ -262,6 +270,35 @@ def format_stock_code(code_6_digits):
         return f"sh{s_code}"
 
 
+# 板块筛选选项与规则（按股票代码前几位）
+MARKET_OPTIONS = ["全部", "沪深主板", "创业板", "科创板", "北交所"]
+
+
+def filter_df_by_market(df, market_option):
+    """按市场类型筛选成分股 DataFrame，需含「代码」列。"""
+    if df is None or df.empty or market_option == "全部" or "代码" not in df.columns:
+        return df
+    codes = df["代码"].astype(str).str.strip().str.zfill(6)
+    if market_option == "沪深主板":
+        # 沪市主板 60xxxx(不含688)、深市主板 000/001/002/003
+        mask = (
+            (codes.str.startswith("6") & ~codes.str.startswith("688"))
+            | codes.str.startswith("000")
+            | codes.str.startswith("001")
+            | codes.str.startswith("002")
+            | codes.str.startswith("003")
+        )
+    elif market_option == "创业板":
+        mask = codes.str.startswith("30")
+    elif market_option == "科创板":
+        mask = codes.str.startswith("688")
+    elif market_option == "北交所":
+        mask = codes.str.startswith("4") | codes.str.startswith("8") | codes.str.startswith("9")
+    else:
+        return df
+    return df.loc[mask].copy()
+
+
 @st.cache_data
 def load_sector_map():
     csv_path = "stock_sector_data.csv"
@@ -330,34 +367,28 @@ def app():
                 st.warning("未获取到板块数据，请检查网络或更换日期。")
                 continue
 
-            df_sectors = pd.DataFrame(sector_data)
-            # 创建代码到名称的映射，用于后续显示
-            code_to_name = dict(zip(df_sectors['代码'], df_sectors['名称']))
+            df_sectors_full = pd.DataFrame(sector_data)
+            code_to_name = dict(zip(df_sectors_full["代码"], df_sectors_full["名称"]))
+            sector_codes = df_sectors_full["代码"].tolist()
 
-            # 4. 左右分栏
+            # 4. 左右分栏（分割线上方：板块排名 + 详情）
             col_list, col_detail = st.columns([4, 6])
 
             with col_list:
                 st.subheader("板块排名")
-
-                # 显示排名表格
+                st.caption("主要显示前10名，往下拖动可看全部")
                 st.dataframe(
-                    df_sectors,
+                    df_sectors_full[["代码", "名称", "强度"]],
                     use_container_width=True,
-                    height=600,
+                    height=400,
                     hide_index=True,
                     column_config={
                         "代码": st.column_config.TextColumn("代码", width="small"),
-                        "名称": st.column_config.TextColumn("名称", width="medium"),
+                        "名称": st.column_config.TextColumn("名称", width="small"),
                         "强度": st.column_config.NumberColumn("强度", format="%.2f", width="small"),
-                        "涨幅%": st.column_config.NumberColumn("涨幅%", format="%.2f%%", width="small")
                     }
                 )
-
-                sector_codes = df_sectors["代码"].tolist()
-                default_code = sector_codes[0] if sector_codes else None
-
-                # 优化选择框：显示名称，返回代码
+                # 下拉可选全部板块查看详情
                 selected_sector_code = st.selectbox(
                     "选择板块查看详情",
                     options=sector_codes,
@@ -420,117 +451,180 @@ def app():
                     son_plate = get_son_plate_info(selected_sector_code)
 
                     if son_plate:
-                        with st.expander("📂 子板块详情", expanded=False):
-                            df_son = pd.DataFrame(son_plate).sort_values(by="强度", ascending=False)
-                            st.dataframe(df_son, use_container_width=True, hide_index=True)
-
-                    # --- C. 成分股 (核心逻辑修改) ---
-                    st.divider()
-                    st.subheader("📊 板块成分股")
-
-                    stock_data = []
-                    is_realtime = (k == 0)
-
-                    if is_realtime:
-                        # --- 路径1：当天数据 (CSV + 腾讯 + 子板块聚合) ---
-                        sector_map_df = load_sector_map()
-                        if sector_map_df is not None:
-                            # 1. 收集所有需要查询的板块代码 (主板块 + 子板块)
-                            target_plate_codes = [str(selected_sector_code)]
-
-                            # 建立板块代码 -> 名称的映射，方便后续显示来源
-                            plate_code_to_name = {str(selected_sector_code): current_sector_name}
-
-                            if son_plate:
-                                for sp in son_plate:
-                                    sp_code = str(sp['代码'])
-                                    target_plate_codes.append(sp_code)
-                                    plate_code_to_name[sp_code] = sp['名称']
-
-                            # 2. 在 CSV 中筛选这些板块的股票
-                            mask = sector_map_df['板块code'].isin(target_plate_codes)
-                            current_sector_stocks = sector_map_df[mask]
-
-                            if not current_sector_stocks.empty:
-                                # 建立股票代码 -> 所属板块名称 的映射
-                                # 如果一只股票出现在多个子板块，优先显示第一个查到的子板块名称
-                                stock_belong_map = {}
-                                for _, row in current_sector_stocks.iterrows():
-                                    s_code = str(row['股票代码']).zfill(6)
-                                    p_code = str(row['板块code'])
-                                    if s_code not in stock_belong_map:
-                                        stock_belong_map[s_code] = plate_code_to_name.get(p_code, "未知板块")
-
-                                # 去重获取股票代码
-                                raw_codes = current_sector_stocks['股票代码'].unique().tolist()
-                                tencent_codes = [format_stock_code(c) for c in raw_codes]
-
-                                # 获取实时行情
-                                tencent_data = get_stock_data_tencent(tencent_codes)
-
-                                for item in tencent_data:
-                                    stock_data.append({
-                                        "代码": item['代码'],
-                                        "名称": item['名称'],
-                                        "涨幅%": item['涨幅%'],
-                                        "价格": item['价格'],
-                                        "成交额": f"{item['成交额']:.0f}万",
-                                        "实际流通值": "-",
-                                        # 显示具体的子板块名称
-                                        "板块": stock_belong_map.get(item['代码'], current_sector_name),
-                                        "连板": "-",
-                                        "龙头": "-"
-                                    })
-                            else:
-                                st.warning(f"本地CSV中未找到该板块及其子板块的成分股映射")
-                        else:
-                            st.error("缺失 stock_sector_data.csv 文件，无法显示当天实时成分股")
-                    else:
-                        # --- 路径2：历史数据 (长横接口) ---
-                        # 历史接口本身包含成分股数据，逻辑不变
-                        stock_data = get_stock_data(selected_sector_code, effective_date, k)
-
-                    # --- 数据展示 ---
-                    if stock_data:
-                        df_stocks = pd.DataFrame(stock_data)
-
-                        # 排序尝试
-                        try:
-                            df_stocks['涨幅%'] = pd.to_numeric(df_stocks['涨幅%'], errors='coerce')
-                            df_stocks.sort_values(by="涨幅%", ascending=False, inplace=True)
-                        except Exception:
-                            pass
-
-                        # 定义列配置
-                        display_cols = [
-                            "代码", "名称", "涨幅%", "价格", "成交额",
-                            "实际流通值", "板块", "连板", "龙头"
-                        ]
-                        # 过滤存在的列
-                        final_cols = [c for c in display_cols if c in df_stocks.columns]
-
-                        # 配置列样式
-                        column_config = {
-                            "代码": st.column_config.TextColumn("代码", width="small"),
-                            "名称": st.column_config.TextColumn("名称", width="medium"),
-                            "涨幅%": st.column_config.NumberColumn("涨幅%", format="%.2f%%", width="small"),
-                            "价格": st.column_config.NumberColumn("价格", format="%.2f", width="small"),
-                            "成交额": st.column_config.TextColumn("成交额", width="small"),
-                            "实际流通值": st.column_config.TextColumn("流通值", width="small"),
-                            "板块": st.column_config.TextColumn("所属板块", width="medium"),
-                            "连板": st.column_config.TextColumn("连板", width="small"),
-                            "龙头": st.column_config.TextColumn("龙头", width="small"),
-                        }
-
+                        st.caption("📂 子板块详情（主要显示前8名，可拖动查看全部）")
+                        df_son = pd.DataFrame(son_plate).sort_values(by="强度", ascending=False)
                         st.dataframe(
-                            df_stocks[final_cols],
+                            df_son,
                             use_container_width=True,
-                            height=500,
+                            height=320,
                             hide_index=True,
-                            column_config=column_config
+                            column_config={
+                                "代码": st.column_config.TextColumn("代码", width="small"),
+                                "名称": st.column_config.TextColumn("名称", width="small"),
+                                "强度": st.column_config.NumberColumn("强度", format="%.2f", width="small"),
+                            }
                         )
-                    else:
-                        st.info("暂无成分股数据")
+
+            # 分割线下方：板块成分股、子板块个股（全宽）
+            if selected_sector_code:
+                st.divider()
+                stock_data = []
+                is_realtime = (k == 0)
+
+                if is_realtime:
+                    # --- 路径1：当天数据，仅主板块成分股 (CSV + 腾讯) ---
+                    sector_map_df = load_sector_map()
+                    if sector_map_df is not None:
+                        mask = sector_map_df['板块code'] == str(selected_sector_code)
+                        current_sector_stocks = sector_map_df[mask]
+                        if not current_sector_stocks.empty:
+                            raw_codes = current_sector_stocks['股票代码'].str.strip().str.zfill(6).unique().tolist()
+                            tencent_codes = [format_stock_code(c) for c in raw_codes]
+                            tencent_data = get_stock_data_tencent(tencent_codes)
+                            for item in tencent_data:
+                                stock_data.append({
+                                    "代码": item["代码"],
+                                    "名称": item["名称"],
+                                    "涨幅%": item["涨幅%"],
+                                    "开盘涨幅%": item.get("开盘涨幅%"),
+                                    "实际流通值": "-",
+                                    "板块": current_sector_name,
+                                    "连板": "-",
+                                    "龙头": "-",
+                                    "价格": item["价格"],
+                                    "成交额": f"{item['成交额']:.0f}万",
+                                })
+                    if not stock_data and sector_map_df is None:
+                        st.error("缺失 stock_sector_data.csv 文件，无法显示当天实时成分股")
+                    elif not stock_data:
+                        st.warning("本地CSV中未找到该板块的成分股映射")
+                else:
+                    # --- 路径2：历史数据 (长横接口) ---
+                    stock_data = get_stock_data(selected_sector_code, effective_date, k)
+
+                # --- 数据展示：板块成分股（前100名 + 市场筛选）---
+                if stock_data:
+                    df_stocks = pd.DataFrame(stock_data)
+                    if "开盘涨幅%" not in df_stocks.columns:
+                        df_stocks["开盘涨幅%"] = None
+                    try:
+                        df_stocks["涨幅%"] = pd.to_numeric(df_stocks["涨幅%"], errors="coerce")
+                        df_stocks.sort_values(by="涨幅%", ascending=False, inplace=True)
+                    except Exception:
+                        pass
+                    df_stocks = df_stocks.head(100)
+
+                    # 列顺序：代码、名称、涨幅%、开盘涨幅%、流通值、所属板块、连板、龙头、价格、成交额
+                    display_cols = [
+                        "代码", "名称", "涨幅%", "开盘涨幅%", "实际流通值", "板块", "连板", "龙头", "价格", "成交额"
+                    ]
+                    final_cols = [c for c in display_cols if c in df_stocks.columns]
+                    column_config = {
+                        "代码": st.column_config.TextColumn("代码", width="small"),
+                        "名称": st.column_config.TextColumn("名称", width="small"),
+                        "涨幅%": st.column_config.NumberColumn("涨幅%", format="%.2f%%", width="small"),
+                        "开盘涨幅%": st.column_config.NumberColumn("开盘涨幅", format="%.2f%%", width="small"),
+                        "实际流通值": st.column_config.TextColumn("流通值", width="small"),
+                        "板块": st.column_config.TextColumn("所属板块", width="small"),
+                        "连板": st.column_config.TextColumn("连板", width="small"),
+                        "龙头": st.column_config.TextColumn("龙头", width="small"),
+                        "价格": st.column_config.NumberColumn("价格", format="%.2f", width="small"),
+                        "成交额": st.column_config.TextColumn("成交额", width="small"),
+                    }
+
+                    tit_col, filter_col = st.columns([3, 1])
+                    with tit_col:
+                        st.subheader("📊 板块成分股（前100）")
+                    with filter_col:
+                        market_filter_main = st.selectbox(
+                            "市场",
+                            options=MARKET_OPTIONS,
+                            index=0,
+                            key=f"market_filter_main_{zs_type}"
+                        )
+                    df_display = filter_df_by_market(df_stocks, market_filter_main)
+                    st.dataframe(
+                        df_display[final_cols] if not df_display.empty else df_stocks[final_cols].head(0),
+                        use_container_width=True,
+                        height=400,
+                        hide_index=True,
+                        column_config=column_config
+                    )
+                else:
+                    st.info("暂无成分股数据")
+
+                # --- D. 各子板块成分股（单独表格，每表前50名 + 市场筛选）---
+                if son_plate:
+                    _display_cols = ["代码", "名称", "涨幅%", "开盘涨幅%", "实际流通值", "连板", "龙头", "价格", "成交额"]
+                    _column_config = {
+                        "代码": st.column_config.TextColumn("代码", width="small"),
+                        "名称": st.column_config.TextColumn("名称", width="small"),
+                        "涨幅%": st.column_config.NumberColumn("涨幅%", format="%.2f%%", width="small"),
+                        "开盘涨幅%": st.column_config.NumberColumn("开盘涨幅", format="%.2f%%", width="small"),
+                        "实际流通值": st.column_config.TextColumn("流通值", width="small"),
+                        "连板": st.column_config.TextColumn("连板", width="small"),
+                        "龙头": st.column_config.TextColumn("龙头", width="small"),
+                        "价格": st.column_config.NumberColumn("价格", format="%.2f", width="small"),
+                        "成交额": st.column_config.TextColumn("成交额", width="small"),
+                    }
+                    for sp in son_plate:
+                        sp_code = str(sp["代码"])
+                        sp_name = sp["名称"]
+                        son_stock_data = []
+                        if is_realtime:
+                            raw_son = get_stock_data(sp_code, effective_date, 0)
+                            if raw_son:
+                                raw_codes = [str(s.get("代码", "")).strip().zfill(6) for s in raw_son if str(s.get("代码", "")).strip()]
+                                raw_codes = [c for c in raw_codes if c]
+                                if raw_codes:
+                                    tencent_codes = [format_stock_code(c) for c in raw_codes]
+                                    tencent_data = get_stock_data_tencent(tencent_codes)
+                                    for item in tencent_data:
+                                        son_stock_data.append({
+                                            "代码": item["代码"],
+                                            "名称": item["名称"],
+                                            "涨幅%": item["涨幅%"],
+                                            "开盘涨幅%": item.get("开盘涨幅%"),
+                                            "实际流通值": "-",
+                                            "连板": "-",
+                                            "龙头": "-",
+                                            "价格": item["价格"],
+                                            "成交额": f"{item['成交额']:.0f}万",
+                                        })
+                        else:
+                            son_stock_data = get_stock_data(sp_code, effective_date, k)
+                        if son_stock_data:
+                            df_son_stocks = pd.DataFrame(son_stock_data)
+                            if "开盘涨幅%" not in df_son_stocks.columns:
+                                df_son_stocks["开盘涨幅%"] = None
+                            try:
+                                df_son_stocks["涨幅%"] = pd.to_numeric(df_son_stocks["涨幅%"], errors="coerce")
+                                df_son_stocks.sort_values(by="涨幅%", ascending=False, inplace=True)
+                            except Exception:
+                                pass
+                            df_son_stocks = df_son_stocks.head(50)
+                            _cols = [c for c in _display_cols if c in df_son_stocks.columns]
+                            tit_col_s, filter_col_s = st.columns([3, 1])
+                            with tit_col_s:
+                                st.subheader(f"📋 子板块：{sp_name} 成分股（前50）")
+                            with filter_col_s:
+                                market_filter_son = st.selectbox(
+                                    "市场",
+                                    options=MARKET_OPTIONS,
+                                    index=0,
+                                    key=f"market_son_{zs_type}_{sp_code}"
+                                )
+                            df_son_display = filter_df_by_market(df_son_stocks, market_filter_son)
+                            st.dataframe(
+                                df_son_display[_cols] if not df_son_display.empty else df_son_stocks[_cols].head(0),
+                                use_container_width=True,
+                                height=400,
+                                hide_index=True,
+                                column_config=_column_config
+                            )
+                        else:
+                            st.subheader(f"📋 子板块：{sp_name} 成分股（前50）")
+                            st.info("暂无该子板块成分股数据")
 
 
 if __name__ == "__main__":

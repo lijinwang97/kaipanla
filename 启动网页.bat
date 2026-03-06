@@ -1,40 +1,43 @@
 @echo off
-chcp 65001 >nul
-title 开盘啦板块成分股 - 本地网页
+title Kaipanla - Local Web
 cd /d "%~dp0"
 
+echo.
 echo ========================================
-echo   开盘啦板块成分股实时数据 - 启动中
+echo   Starting Kaipanla (Streamlit)...
 echo ========================================
 echo.
+echo Dir: %CD%
+echo.
 
-REM 优先使用 python，若无则尝试 py（Windows 安装器）
+where py >nul 2>&1
+if %errorlevel% equ 0 (
+  set PY_CMD=py -3
+  goto :run
+)
 where python >nul 2>&1
 if %errorlevel% equ 0 (
-    set PY_CMD=python
-) else (
-    where py >nul 2>&1
-    if %errorlevel% equ 0 (
-        set PY_CMD=py -3
-    ) else (
-        echo [错误] 未检测到 Python，请先安装 Python 并勾选 "Add to PATH"。
-        echo 下载地址: https://www.python.org/downloads/
-        pause
-        exit /b 1
-    )
+  set PY_CMD=python
+  goto :run
 )
+echo [ERROR] Python not found. Install Python and add to PATH.
+echo https://www.python.org/downloads/
+echo.
+pause
+exit /b 1
 
-echo 正在启动网页服务，请稍候...
-echo 启动成功后，浏览器将自动打开页面；若未打开，请手动访问: http://localhost:8501
-echo 关闭本窗口即可停止服务。
+:run
+echo Using: %PY_CMD%
+echo.
+echo Starting Streamlit... Open browser: http://localhost:8501
+echo Close this window to stop the server.
 echo.
 
-"%PY_CMD%" -m streamlit run kaipanla_bankuai1.py --server.port 8501 --server.address 127.0.0.1
+%PY_CMD% -u -m streamlit run kaipanla_bankuai1.py --server.port 8501 --server.address 127.0.0.1 --server.headless true
 
-if %errorlevel% neq 0 (
-    echo.
-    echo [提示] 若提示缺少模块，请在本目录打开命令行并执行:
-    echo   pip install -r requirements.txt
-    echo.
+if not %errorlevel% equ 0 (
+  echo.
+  echo If missing modules, run in this folder: pip install -r requirements.txt
+  echo.
 )
 pause

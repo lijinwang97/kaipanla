@@ -157,16 +157,21 @@ def get_stock_data_tencent(stock_codes):
                 # 腾讯数据位：3现价 4昨收 5今开 31涨跌额 32涨幅% 33最高 34最低 36成交量 37成交额
                 if len(content) > 37:
                     price = float(content[3])
+                    prev_close = float(content[4]) if content[4] else None
+                    open_p = float(content[5]) if content[5] else None
                     try:
-                        open_p = float(content[5]) if content[5] else 0
-                        open_chg_pct = round((price - open_p) / open_p * 100, 2) if open_p and open_p > 0 else None
-                    except (ValueError, IndexError):
+                        # 开盘涨幅 = (今开 - 昨收) / 昨收 * 100（开盘相对昨收的高开/低开幅度）
+                        if prev_close and prev_close > 0 and open_p is not None:
+                            open_chg_pct = round((open_p - prev_close) / prev_close * 100, 2)
+                        else:
+                            open_chg_pct = None
+                    except (ValueError, IndexError, TypeError):
                         open_chg_pct = None
                     all_results.append({
                         "代码": content[2],
                         "名称": content[1],
                         "价格": price,
-                        "今开": float(content[5]) if len(content) > 5 and content[5] else None,
+                        "今开": open_p,
                         "开盘涨幅%": open_chg_pct,
                         "涨跌额": float(content[31]),
                         "涨幅%": float(content[32]),
@@ -573,6 +578,10 @@ def app():
                         son_stock_data = []
                         if is_realtime:
                             raw_son = get_stock_data(sp_code, effective_date, 0)
+                            # 当天实时接口对子板块常返回空，用前一交易日历史接口取成分股列表，再拉腾讯实时价
+                            if not raw_son:
+                                prev_date = get_previous_trading_day(datetime.date.today())
+                                raw_son = get_stock_data(sp_code, prev_date.strftime("%Y-%m-%d"), 1)
                             if raw_son:
                                 raw_codes = [str(s.get("代码", "")).strip().zfill(6) for s in raw_son if str(s.get("代码", "")).strip()]
                                 raw_codes = [c for c in raw_codes if c]
